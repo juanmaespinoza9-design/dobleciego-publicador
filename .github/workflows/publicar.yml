@@ -40,9 +40,7 @@ jobs:
         env:
           IG_TOKEN: ${{ secrets.IG_TOKEN }}
           IG_USER_ID: ${{ secrets.IG_USER_ID }}
-          IG_TOKEN_FECHA: ${{ vars.IG_TOKEN_FECHA }}
           GH_TOKEN: ${{ github.token }}
-          GH_PAT_SECRETS: ${{ secrets.GH_PAT_SECRETS }}
           ENSAYO: ${{ inputs.ensayo }}
           MODO: ${{ inputs.modo }}
         run: |
@@ -51,3 +49,11 @@ jobs:
           [ "$MODO" = "simulacro" ] && args+=(--simulacro)
           [ "$MODO" = "conciliar" ] && args+=(--conciliar)
           python3 publicar.py "${args[@]}"
+
+      - name: Renovar token
+        if: always() && inputs.modo != 'simulacro'
+        env:
+          IG_TOKEN: ${{ secrets.IG_TOKEN }}
+          IG_TOKEN_FECHA: ${{ vars.IG_TOKEN_FECHA }}
+          GH_PAT_SECRETS: ${{ secrets.GH_PAT_SECRETS }}
+        run: python3 publicar.py --solo-renovar

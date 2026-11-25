@@ -4,8 +4,8 @@ Publica en Instagram, como máximo un reel por corrida, el primer reel pendiente
 programa/<ENSAYO>.json lo escribe la Mac; estado/<ENSAYO>.json lo escribe solo este script.
 Si existe el archivo PAUSA en la raíz, no se publica nada.
 
-Uso: python3 publicar.py [--ensayo NOMBRE] [--simulacro] [--conciliar] [--listar] [--sin-git]
-Entorno: IG_TOKEN, IG_USER_ID, IG_TOKEN_FECHA (AAAA-MM-DD), GH_TOKEN, GH_PAT_SECRETS.
+Uso: python3 publicar.py [--ensayo NOMBRE] [--simulacro] [--conciliar] [--listar] [--sin-git] [--solo-renovar]
+Entorno: IG_TOKEN, IG_USER_ID, GH_TOKEN. Solo con --solo-renovar: IG_TOKEN_FECHA (AAAA-MM-DD) y GH_PAT_SECRETS.
 """
 import argparse
 import datetime as dt
@@ -19,32 +19,42 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from http.client import HTTPException
 
 RAIZ = os.path.dirname(os.path.abspath(__file__))
 API = "https://graph.instagram.com"
-VERSION = "v23.0"
-# Nombre del parámetro de Meta que rotula el reel como contenido generado por IA.
-# Sin verificar que exista: mientras sea None no se envía nada.
-ROTULO_IA = None
+API_VERSION = "v27.0"
+# Parámetro de Meta que rotula el contenido como generado por IA (confirmado en la documentación
+# de publicación; falta confirmarlo para reels). Si el contenedor falla por él, ponerlo en None.
+ROTULO_IA = "is_ai_generated"
 
 MAX_CAPTION = 2200
 MAX_HASHTAGS = 30
+MAX_MENCIONES = 20
 HORAS_ENTRE_PUBLICACIONES = 20
-SONDEO_SEG = 30
+SONDEO_SEG = 60
 SONDEO_LIMITE_SEG = 600
 DIAS_RENOVAR_TOKEN = 7
 UTC_AR = dt.timedelta(hours=-3)
+ESTADOS = ("en_curso", "publicado", "error")
+REQUERIDOS = ("ensayo", "fecha", "video_url", "cover_url", "caption", "sha256_video")
+NOMBRE_ENSAYO = re.compile(r"^[A-Za-z0-9 _-]+$")
+SECRETOS_EXTRA = []
 
 
 class Fallo(Exception):
     pass
 
 
+class Transitorio(Fallo):
+    """Red, timeout, 5xx o 429: no se escribe estado y se reintenta en la próxima corrida."""
+
+
 def mascara(texto):
     texto = str(texto)
-    token = os.environ.get("IG_TOKEN", "")
-    if token:
-        texto = texto.replace(token, "***")
+    for token in [os.environ.get("IG_TOKEN", ""), *SECRETOS_EXTRA]:
+        if token:
+            texto = texto.replace(token, "***")
     return re.sub(r"(access_token=)[^&\s\"']+", r"\1***", texto)
 
 
@@ -78,13 +88,17 @@ def http(metodo, url, datos=None, sha=False):
             return r.status, h.hexdigest()
     except urllib.error.HTTPError as e:
         return e.code, e.read()
-    except (urllib.error.URLError, OSError) as e:
-        raise Fallo("Error de red: " + mascara(e))
+    except (urllib.error.URLError, HTTPException, OSError) as e:
+        raise Transitorio("Error de red: " + mascara(e))
 
 
-def api(metodo, ruta, **params):
-    params["access_token"] = os.environ["IG_TOKEN"]
-    base = f"{API}/{ruta}" if ruta == "refresh_access_token" else f"{API}/{VERSION}/{ruta}"
+def transitorio(codigo):
+    return codigo >= 500 or codigo == 429
+
+
+def api(metodo, ruta, token=None, **params):
+    params["access_token"] = token or os.environ["IG_TOKEN"]
+    base = f"{API}/{ruta}" if ruta == "refresh_access_token" else f"{API}/{API_VERSION}/{ruta}"
     if metodo == "GET":
         codigo, cuerpo = http("GET", base + "?" + urllib.parse.urlencode(params))
     else:
@@ -92,23 +106,52 @@ def api(metodo, ruta, **params):
     try:
         r = json.loads(cuerpo)
     except (ValueError, TypeError):
-        raise Fallo(mascara(f"Respuesta no válida de la API (HTTP {codigo})"))
+        raise (Transitorio if transitorio(codigo) else Fallo)(mascara(f"Respuesta no válida de la API (HTTP {codigo})"))
     if codigo >= 400 or "error" in r:
         e = r.get("error", {}) if isinstance(r, dict) else {}
-        raise Fallo(mascara(f"API de Meta (HTTP {codigo}, código {e.get('code')}): {e.get('message', r)}"))
+        clase = Transitorio if transitorio(codigo) or e.get("is_transient") else Fallo
+        raise clase(mascara(f"API de Meta (HTTP {codigo}, código {e.get('code')}): {e.get('message', r)}"))
     return r
+
+
+def leer_json(ruta):
+    with open(ruta, encoding="utf-8") as f:
+        return json.load(f)
 
 
 def leer(ruta, defecto=None):
     try:
-        with open(ruta, encoding="utf-8") as f:
-            return json.load(f)
+        return leer_json(ruta)
     except (OSError, ValueError):
         return defecto
 
 
 def ruta_de(carpeta, ensayo):
     return os.path.join(RAIZ, carpeta, f"{ensayo}.json")
+
+
+def faltantes(p):
+    if not isinstance(p, dict):
+        return ["JSON ilegible"]
+    falta = [k for k in REQUERIDOS if not p.get(k)]
+    try:
+        dt.date.fromisoformat(str(p.get("fecha")))
+    except ValueError:
+        falta.append("fecha válida")
+    return falta
+
+
+def leer_estado(ensayo):
+    ruta = ruta_de("estado", ensayo)
+    if not os.path.exists(ruta):
+        return None
+    try:
+        est = leer_json(ruta)
+    except (OSError, ValueError):
+        est = None
+    if not isinstance(est, dict) or est.get("estado") not in ESTADOS:
+        raise Fallo(f"BLOQUEADO: estado/{ensayo}.json está dañado o tiene un estado desconocido; corregirlo a mano.")
+    return est
 
 
 def cola():
@@ -119,8 +162,11 @@ def cola():
         if not nombre.endswith(".json"):
             continue
         p = leer(os.path.join(carpeta, nombre))
-        if p:
-            filas.append((p, leer(ruta_de("estado", p["ensayo"]))))
+        falta = faltantes(p)
+        if falta:
+            aviso(f"programa/{nombre}: inválido ({', '.join(falta)}); se saltea.")
+            continue
+        filas.append((p, leer_estado(p["ensayo"])))
     filas.sort(key=lambda f: (f[0]["fecha"], f[0]["ensayo"]))
     return filas
 
@@ -134,27 +180,54 @@ def git(*args):
     r = subprocess.run(["git", "-C", RAIZ, *args], capture_output=True, text=True)
     if r.returncode:
         raise Fallo(mascara(f"git {' '.join(args)}: {r.stderr.strip() or r.stdout.strip()}"))
+    return r.stdout
 
 
-def guardar_estado(ensayo, datos, args):
-    if args.simulacro:
+def subir_cambios(ruta, mensaje):
+    git("add", "-A", "--", ruta)
+    if subprocess.run(["git", "-C", RAIZ, "diff", "--cached", "--quiet", "--", ruta]).returncode == 0:
         return
-    datos = {"estado": "", "contenedor_id": "", "media_id": "", "enlace": "", "detalle": "", **datos,
-             "momento": ahora().strftime("%Y-%m-%dT%H:%M:%SZ")}
-    ruta = ruta_de("estado", ensayo)
-    os.makedirs(os.path.dirname(ruta), exist_ok=True)
-    with open(ruta, "w", encoding="utf-8") as f:
-        json.dump(datos, f, ensure_ascii=False, indent=2)
-        f.write("\n")
-    if args.sin_git:
-        return
-    git("add", ruta)
-    git("commit", "-m", f"estado: {ensayo} {datos['estado']}")
+    git("commit", "-m", mensaje)
     try:
         git("push")
     except Fallo:
         git("pull", "--rebase")
         git("push")
+
+
+def guardar_estado(ensayo, datos, args):
+    """Escribe estado/<ensayo>.json (o lo borra si datos es None) y lo sube a git."""
+    if args.simulacro:
+        return
+    ruta = ruta_de("estado", ensayo)
+    if datos is None:
+        if os.path.exists(ruta):
+            os.remove(ruta)
+        mensaje = f"estado: {ensayo} vuelve a pendiente"
+    else:
+        datos = {"estado": "", "contenedor_id": "", "media_id": "", "enlace": "", "detalle": "", **datos,
+                 "momento": ahora().strftime("%Y-%m-%dT%H:%M:%SZ")}
+        os.makedirs(os.path.dirname(ruta), exist_ok=True)
+        with open(ruta, "w", encoding="utf-8") as f:
+            json.dump(datos, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        mensaje = f"estado: {ensayo} {datos['estado']}"
+    if not args.sin_git:
+        subir_cambios(ruta, mensaje)
+
+
+def pausa_en_disco():
+    return any(n.lower().startswith("pausa") and os.path.isfile(os.path.join(RAIZ, n)) for n in os.listdir(RAIZ))
+
+
+def hay_pausa(args):
+    if pausa_en_disco():
+        return True
+    if args.sin_git:
+        return False
+    git("fetch", "origin")
+    rama = git("rev-parse", "--abbrev-ref", "HEAD").strip()
+    return any(n.lower().startswith("pausa") for n in git("ls-tree", "--name-only", f"origin/{rama}").splitlines())
 
 
 def listar_media(paginas=1):
@@ -183,23 +256,29 @@ def momento(m):
 def resolver_en_curso(args):
     """Cierra los reels `en_curso` de una corrida anterior. Devuelve código de salida o None."""
     for p, est in cola():
-        if not est or est.get("estado") != "en_curso":
+        if not est or est["estado"] != "en_curso":
             continue
         ensayo = p["ensayo"]
         aviso(f"{ensayo}: quedó en_curso; consultando el contenedor.")
         try:
             codigo = api("GET", est["contenedor_id"], fields="status_code").get("status_code")
-        except Fallo as e:
-            aviso(f"{ensayo}: no se pudo consultar el contenedor: {e}")
+            detalle = f"El contenedor está en {codigo}; revisar a mano."
+        except Transitorio as e:
+            aviso(f"{ensayo}: no se pudo consultar el contenedor ahora, se reintenta luego: {e}")
             return 1
-        if codigo == "PUBLISHED":
-            m = buscar_por_linea(listar_media(1), p["caption"]) or {}
-            guardar_estado(ensayo, {**est, "estado": "publicado", "media_id": m.get("id", est.get("media_id", "")),
-                                    "enlace": m.get("permalink", ""), "detalle": "Confirmado como publicado."}, args)
-            aviso(f"{ensayo}: ya estaba publicado; estado corregido.")
-            return 0
-        guardar_estado(ensayo, {**est, "estado": "error", "detalle": f"Quedó en curso y el contenedor está en {codigo}; revisar a mano."}, args)
-        aviso(f"{ensayo}: marcado como error (contenedor en {codigo}). No se reintenta solo.")
+        except Fallo as e:
+            aviso(f"{ensayo}: el contenedor no se puede consultar ({e}); se busca en las publicaciones.")
+            codigo, detalle = None, f"El contenedor no se pudo consultar: {e}"
+        if codigo == "PUBLISHED" or codigo is None:
+            m = buscar_por_linea(listar_media(1), p["caption"])
+            if m or codigo == "PUBLISHED":
+                m = m or {}
+                guardar_estado(ensayo, {**est, "estado": "publicado", "media_id": m.get("id", est.get("media_id", "")),
+                                        "enlace": m.get("permalink", ""), "detalle": "Confirmado como publicado."}, args)
+                aviso(f"{ensayo}: ya estaba publicado; estado corregido.")
+                return 0
+        guardar_estado(ensayo, {**est, "estado": "error", "detalle": detalle}, args)
+        aviso(f"{ensayo}: marcado como error ({detalle}) No se reintenta solo.")
         return 1
     return None
 
@@ -211,30 +290,41 @@ def controlar(p):
     etiquetas = len(re.findall(r"(?<!\w)#\w+", caption))
     if etiquetas > MAX_HASHTAGS:
         raise Fallo(f"Caption con {etiquetas} hashtags (máximo {MAX_HASHTAGS}).")
+    menciones = len(re.findall(r"(?<!\w)@\w", caption))
+    if menciones > MAX_MENCIONES:
+        raise Fallo(f"Caption con {menciones} menciones (máximo {MAX_MENCIONES}).")
     codigo, huella = http("GET", p["video_url"], sha=True)
+    if transitorio(codigo):
+        raise Transitorio(f"El video respondió HTTP {codigo}.")
     if codigo != 200:
         raise Fallo(f"El video respondió HTTP {codigo}.")
     if huella != p["sha256_video"]:
         raise Fallo("El sha256 del video descargado no coincide con el programa.")
     codigo, _ = http("GET", p["cover_url"])
+    if transitorio(codigo):
+        raise Transitorio(f"La portada respondió HTTP {codigo}.")
     if codigo != 200:
         raise Fallo(f"La portada respondió HTTP {codigo}.")
     return caption
 
 
 def esperar_contenedor(cid):
-    inicio = 0
+    espera = 0
     while True:
-        codigo = api("GET", cid, fields="status_code").get("status_code")
+        try:
+            codigo = api("GET", cid, fields="status_code").get("status_code")
+        except Transitorio as e:
+            aviso(f"Consulta del contenedor fallida, se sigue esperando: {e}")
+            codigo = None
         aviso(f"Contenedor {cid}: {codigo}")
         if codigo == "FINISHED":
             return
         if codigo in ("ERROR", "EXPIRED"):
             raise Fallo(f"El contenedor terminó en {codigo}.")
-        if inicio >= SONDEO_LIMITE_SEG:
+        if espera >= SONDEO_LIMITE_SEG:
             raise Fallo(f"El contenedor no terminó en {SONDEO_LIMITE_SEG // 60} minutos (último estado: {codigo}).")
         dormir(SONDEO_SEG)
-        inicio += SONDEO_SEG
+        espera += SONDEO_SEG
 
 
 def abrir_issue(p, enlace_ig):
@@ -247,12 +337,16 @@ def abrir_issue(p, enlace_ig):
 
 
 def publicar(args):
-    p = None
     if args.ensayo:
         p = leer(ruta_de("programa", args.ensayo))
-        if not p:
-            aviso(f"No existe programa/{args.ensayo}.json")
+        falta = faltantes(p)
+        if falta:
+            aviso(f"programa/{args.ensayo}.json no sirve ({', '.join(falta)}).")
             return 1
+        est = leer_estado(args.ensayo)
+        if est and est["estado"] == "publicado":
+            aviso(f"{args.ensayo} ya figura como publicado ({est.get('enlace', '')}); no se republica.")
+            return 0
     else:
         pendientes = [x for x, est in cola() if est is None and x["fecha"] <= hoy().isoformat()]
         if not pendientes:
@@ -275,6 +369,9 @@ def publicar(args):
 
     try:
         caption = controlar(p)
+    except Transitorio as e:
+        aviso(f"{ensayo}: falla transitoria en los controles, se reintenta en la próxima corrida: {e}")
+        return 1
     except Fallo as e:
         aviso(f"{ensayo}: control fallido: {e}")
         guardar_estado(ensayo, {"estado": "error", "detalle": f"Control previo: {e}"}, args)
@@ -286,9 +383,15 @@ def publicar(args):
         params[ROTULO_IA] = "true"
     try:
         cid = api("POST", f"{os.environ['IG_USER_ID']}/media", **params)["id"]
+    except Transitorio as e:
+        aviso(f"{ensayo}: falla transitoria al crear el contenedor, se reintenta en la próxima corrida: {e}")
+        return 1
     except Fallo as e:
-        aviso(f"{ensayo}: no se pudo crear el contenedor: {e}")
-        guardar_estado(ensayo, {"estado": "error", "detalle": f"Crear contenedor: {e}"}, args)
+        detalle = f"Crear contenedor: {e}"
+        if ROTULO_IA and ROTULO_IA in str(e):
+            detalle += f" Si el error es por «{ROTULO_IA}», poner ROTULO_IA = None en publicar.py."
+        aviso(f"{ensayo}: {detalle}")
+        guardar_estado(ensayo, {"estado": "error", "detalle": detalle}, args)
         return 1
     aviso(f"{ensayo}: contenedor {cid} creado.")
     guardar_estado(ensayo, {"estado": "en_curso", "contenedor_id": cid}, args)
@@ -304,9 +407,24 @@ def publicar(args):
         return 0
 
     try:
-        media_id = api("POST", f"{os.environ['IG_USER_ID']}/media_publish", creation_id=cid)["id"]
+        pausado = hay_pausa(args)
     except Fallo as e:
-        aviso(f"{ensayo}: falló media_publish; queda en_curso para revisarlo en la próxima corrida: {e}")
+        aviso(f"{ensayo}: no se pudo confirmar que no haya PAUSA, no se publica: {e}")
+        guardar_estado(ensayo, None, args)
+        return 1
+    if pausado:
+        aviso(f"{ensayo}: apareció PAUSA antes de publicar; el reel vuelve a pendiente.")
+        guardar_estado(ensayo, None, args)
+        return 0
+
+    try:
+        media_id = api("POST", f"{os.environ['IG_USER_ID']}/media_publish", creation_id=cid)["id"]
+    except Transitorio as e:
+        aviso(f"{ensayo}: media_publish falló sin respuesta clara; queda en_curso y la próxima corrida lo resuelve: {e}")
+        return 1
+    except Fallo as e:
+        aviso(f"{ensayo}: media_publish rechazado: {e}")
+        guardar_estado(ensayo, {"estado": "error", "contenedor_id": cid, "detalle": f"media_publish: {e}"}, args)
         return 1
     try:
         enlace = api("GET", media_id, fields="permalink").get("permalink", "")
@@ -328,13 +446,13 @@ def conciliar(args):
     media = listar_media(20)
     publicados, pendientes = [], []
     for p, est in cola():
-        ya = est and est.get("estado") == "publicado"
+        ya = est and est["estado"] == "publicado"
         m = None if ya else buscar_por_linea(media, p["caption"])
         if m:
             guardar_estado(p["ensayo"], {"estado": "publicado", "media_id": m["id"], "enlace": m.get("permalink", ""),
                                          "detalle": "Conciliado con Instagram."}, args)
         if ya or m:
-            publicados.append((p, (est or {}).get("enlace") if ya else m.get("permalink", "")))
+            publicados.append((p, est.get("enlace") if ya else m.get("permalink", "")))
         else:
             pendientes.append((p, est))
     print("PUBLICADOS")
@@ -352,60 +470,100 @@ def listar():
     return 0
 
 
-def renovar_token():
-    fecha = os.environ.get("IG_TOKEN_FECHA", "").strip()
-    if not fecha or not os.environ.get("IG_TOKEN"):
+def gh_con_reintento(cmd, entrada, env):
+    for intento in (1, 2):
+        r = subprocess.run(cmd, input=entrada, env=env, capture_output=True, text=True)
+        if r.returncode == 0:
+            return
+        aviso(f"{' '.join(cmd[:3])} falló (intento {intento}): {r.stderr.strip()}")
+    raise Fallo(f"{' '.join(cmd[:3])} falló dos veces")
+
+
+def renovar_token(args):
+    """Único camino que usa GH_PAT_SECRETS. Renueva el token si pasaron más de DIAS_RENOVAR_TOKEN días."""
+    try:
+        fecha = dt.date.fromisoformat(os.environ.get("IG_TOKEN_FECHA", "").strip())
+    except ValueError:
+        print("!!! IG_TOKEN_FECHA falta o no es AAAA-MM-DD: no se puede saber cuándo renovar el token de Instagram. "
+              "Definir la variable con la fecha de emisión del token.", flush=True)
+        return 1
+    if (hoy() - fecha).days <= DIAS_RENOVAR_TOKEN:
+        print(f"Token con {(hoy() - fecha).days} días: todavía no toca renovarlo.")
         return 0
     try:
-        if (hoy() - dt.date.fromisoformat(fecha)).days <= DIAS_RENOVAR_TOKEN:
-            return 0
-        nuevo = api("GET", "refresh_access_token", grant_type="ig_refresh_token")["access_token"]
-        env = {**os.environ, "GH_TOKEN": os.environ.get("GH_PAT_SECRETS", "")}
+        nuevo = api("GET", "refresh_access_token", grant_type="ig_refresh_token").get("access_token")
+        if not isinstance(nuevo, str) or not nuevo.strip():
+            raise Fallo("la API devolvió un token vacío")
+        SECRETOS_EXTRA.append(nuevo)
+        if os.environ.get("GITHUB_ACTIONS"):
+            print(f"::add-mask::{nuevo}", flush=True)
+        api("GET", "me", token=nuevo, fields="user_id")
+        if not os.environ.get("GH_PAT_SECRETS"):
+            raise Fallo("falta GH_PAT_SECRETS")
+        env = {**os.environ, "GH_TOKEN": os.environ["GH_PAT_SECRETS"]}
         repo = ["--repo", os.environ["GITHUB_REPOSITORY"]] if os.environ.get("GITHUB_REPOSITORY") else []
-        r = subprocess.run(["gh", "secret", "set", "IG_TOKEN", *repo], input=nuevo, env=env, capture_output=True, text=True)
-        if r.returncode:
-            raise Fallo(f"gh secret set: {r.stderr.strip()}")
-        r = subprocess.run(["gh", "variable", "set", "IG_TOKEN_FECHA", "--body", hoy().isoformat(), *repo],
-                           env=env, capture_output=True, text=True)
-        if r.returncode:
-            raise Fallo(f"gh variable set: {r.stderr.strip()}")
-    except (Fallo, ValueError, KeyError) as e:
+        gh_con_reintento(["gh", "secret", "set", "IG_TOKEN", *repo], nuevo, env)
+        gh_con_reintento(["gh", "variable", "set", "IG_TOKEN_FECHA", "--body", hoy().isoformat(), *repo], None, env)
+    except Fallo as e:
         print(mascara(f"!!! NO SE PUDO RENOVAR EL TOKEN DE INSTAGRAM: {e}. Vence a los 60 días; renovarlo a mano."), flush=True)
         return 1
     aviso("Token de Instagram renovado.")
+    try:
+        with open(os.path.join(RAIZ, "ultima_renovacion.txt"), "w", encoding="utf-8") as f:
+            f.write(hoy().isoformat() + "\n")
+        if not args.sin_git:
+            subir_cambios("ultima_renovacion.txt", f"renovación del token {hoy().isoformat()}")
+    except (Fallo, OSError) as e:
+        print(mascara(f"ADVERTENCIA: no se pudo registrar ultima_renovacion.txt ({e}); sin actividad GitHub puede "
+                      "desactivar el cron."), flush=True)
+        return 1
     return 0
+
+
+def ensayo_valido(texto):
+    if not NOMBRE_ENSAYO.match(texto):
+        raise argparse.ArgumentTypeError("solo letras, números, espacios, guion y guion bajo")
+    return texto
+
+
+def ejecutar(args):
+    if args.listar:
+        return listar()
+    if args.solo_renovar:
+        if not os.environ.get("IG_TOKEN"):
+            print("Falta IG_TOKEN en el entorno.")
+            return 1
+        return renovar_token(args)
+    if not args.conciliar and pausa_en_disco():
+        print("Existe un archivo PAUSA: no se publica nada.")
+        return 0
+    if not os.environ.get("IG_TOKEN") or not os.environ.get("IG_USER_ID"):
+        print("Faltan IG_TOKEN o IG_USER_ID en el entorno.")
+        return 1
+    if args.conciliar:
+        return conciliar(args)
+    rc = resolver_en_curso(args)
+    return publicar(args) if rc is None else rc
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
-    ap.add_argument("--ensayo", help="fuerza un ensayo puntual")
+    ap.add_argument("--ensayo", type=ensayo_valido, help="fuerza un ensayo puntual")
     ap.add_argument("--simulacro", action="store_true", help="llega hasta FINISHED sin publicar ni escribir estado")
     ap.add_argument("--conciliar", action="store_true", help="marca como publicados los que ya están en Instagram")
     ap.add_argument("--listar", action="store_true", help="muestra la cola sin usar la red")
-    ap.add_argument("--sin-git", action="store_true", help="escribe el estado sin commit ni push")
+    ap.add_argument("--sin-git", action="store_true", help="escribe el estado sin commit ni push; PAUSA solo en disco")
+    ap.add_argument("--solo-renovar", action="store_true", help="solo renueva el token si toca")
     args = ap.parse_args(argv)
-
-    if args.listar:
-        return listar()
-    if not args.conciliar and os.path.exists(os.path.join(RAIZ, "PAUSA")):
-        print("Existe el archivo PAUSA: no se publica nada.")
-        return renovar_token()
-    if not os.environ.get("IG_TOKEN") or not os.environ.get("IG_USER_ID"):
-        print("Faltan IG_TOKEN o IG_USER_ID en el entorno.")
-        return 1
+    if os.environ.get("GITHUB_ACTIONS") and os.environ.get("IG_TOKEN"):
+        print(f"::add-mask::{os.environ['IG_TOKEN']}", flush=True)
     try:
-        if args.conciliar:
-            rc = conciliar(args)
-        else:
-            rc = resolver_en_curso(args)
-            if rc is None:
-                rc = publicar(args)
+        return ejecutar(args)
     except Fallo as e:
         aviso(f"Error: {e}")
-        rc = 1
-    if not args.simulacro:
-        rc = renovar_token() or rc
-    return rc
+    except Exception as e:
+        aviso(f"Error inesperado ({type(e).__name__}): {e}")
+    return 1
 
 
 if __name__ == "__main__":

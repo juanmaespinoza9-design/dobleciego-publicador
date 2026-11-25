@@ -4,9 +4,11 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.error
 from contextlib import redirect_stdout
 from unittest import mock
 
@@ -23,6 +25,10 @@ def programa(ensayo, fecha, caption=None):
             "sha256_video": "abc", "tiktok": "texto tiktok"}
 
 
+def meta(codigo, mensaje="fallo", **extra):
+    return codigo, json.dumps({"error": {"message": mensaje, "code": 1, **extra}}).encode()
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()
@@ -35,10 +41,11 @@ class Base(unittest.TestCase):
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
-        os.environ.pop("IG_TOKEN_FECHA", None)
-        self.llamadas = []
-        self.issues = []
-        self.media = []
+        for v in ("IG_TOKEN_FECHA", "GITHUB_ACTIONS", "GH_PAT_SECRETS", "GITHUB_REPOSITORY"):
+            os.environ.pop(v, None)
+        self.llamadas, self.issues, self.media = [], [], []
+        self.fallos = {}
+        self.al_consultar = None
         self.estado_contenedor = ["FINISHED"]
         self.red = mock.patch.object(publicar, "http", self.falsa_red)
         self.red.start()
@@ -61,18 +68,31 @@ class Base(unittest.TestCase):
     def falsa_red(self, metodo, url, datos=None, sha=False):
         self.llamadas.append((metodo, url, datos))
         if "/media_publish" in url:
-            return 200, json.dumps({"id": "M1"}).encode()
-        if url.endswith("/42/media") and metodo == "POST":
-            return 200, json.dumps({"id": "C1"}).encode()
-        if "/42/media?" in url:
-            return 200, json.dumps({"data": self.media}).encode()
-        if "/C1?" in url or "/C9?" in url:
-            return 200, json.dumps({"status_code": self.estado_contenedor.pop(0) if len(self.estado_contenedor) > 1 else self.estado_contenedor[0]}).encode()
-        if "/M1?" in url:
-            return 200, json.dumps({"permalink": "https://instagram.com/reel/M1"}).encode()
-        if sha:
-            return 200, "abc"
-        return 200, b"x"
+            clave, ok = "publish", (200, json.dumps({"id": "M1"}).encode())
+        elif url.endswith("/42/media") and metodo == "POST":
+            clave, ok = "crear", (200, json.dumps({"id": "C1"}).encode())
+        elif "/42/media?" in url:
+            clave, ok = "listar", (200, json.dumps({"data": self.media}).encode())
+        elif "/C1?" in url or "/C9?" in url:
+            clave = "contenedor"
+            if self.al_consultar:
+                self.al_consultar()
+            e = self.estado_contenedor
+            ok = (200, json.dumps({"status_code": e.pop(0) if len(e) > 1 else e[0]}).encode())
+        elif "/M1?" in url:
+            clave, ok = "permalink", (200, json.dumps({"permalink": "https://instagram.com/reel/M1"}).encode())
+        elif "refresh_access_token" in url:
+            clave, ok = "refresh", (200, json.dumps({"access_token": "NUEVO_TOKEN"}).encode())
+        elif "/me?" in url:
+            clave, ok = "me", (200, json.dumps({"user_id": "42"}).encode())
+        elif sha:
+            clave, ok = "sha", (200, "abc")
+        else:
+            clave, ok = "portada", (200, b"x")
+        v = self.fallos.get(clave)
+        if isinstance(v, Exception):
+            raise v
+        return v or ok
 
     def correr(self, *argv):
         with redirect_stdout(io.StringIO()) as s:
@@ -92,6 +112,21 @@ class Pruebas(Base):
         self.assertIn("PAUSA", salida)
         self.assertEqual(self.llamadas, [])
 
+    def test_pausa_cualquier_mayuscula_y_sufijo(self):
+        self.agregar(programa("A", "2026-11-30"))
+        open(os.path.join(self.dir, "Pausa.txt"), "w").close()
+        self.correr()
+        self.assertEqual(self.llamadas, [])
+
+    def test_pausa_aparece_entre_contenedor_y_publicacion(self):
+        self.agregar(programa("A", "2026-11-30"))
+        self.al_consultar = lambda: open(os.path.join(self.dir, "pausa"), "w").close()
+        rc, salida = self.correr()
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.publicaciones(), [])
+        self.assertIsNone(self.estado("A"))
+        self.assertIn("PAUSA", salida)
+
     def test_elige_pendiente_por_fecha(self):
         self.agregar(programa("B", "2026-11-29"))
         self.agregar(programa("A", "2026-11-29"))
@@ -104,6 +139,19 @@ class Pruebas(Base):
         self.assertIsNone(self.estado("FUTURO"))
         self.assertEqual(len(self.publicaciones()), 1)
         self.assertEqual(self.issues, ["A"])
+
+    def test_envia_rotulo_ia(self):
+        self.agregar(programa("A", "2026-11-29"))
+        self.correr()
+        crear = next(c for c in self.llamadas if c[0] == "POST" and c[1].endswith("/42/media"))
+        self.assertEqual(crear[2]["is_ai_generated"], "true")
+
+    def test_rotulo_rechazado_sugiere_ponerlo_en_none(self):
+        self.agregar(programa("A", "2026-11-29"))
+        self.fallos["crear"] = meta(400, "Param is_ai_generated is not supported")
+        rc, _ = self.correr()
+        self.assertEqual(rc, 1)
+        self.assertIn("ROTULO_IA = None", self.estado("A")["detalle"])
 
     def test_hoy_es_hora_argentina(self):
         with mock.patch.object(publicar, "ahora", lambda: dt.datetime(2026, 12, 2, 1, 0, tzinfo=dt.timezone.utc)):
@@ -153,6 +201,114 @@ class Pruebas(Base):
         self.assertNotEqual(rc, 0)
         self.assertEqual(self.estado("A")["estado"], "error")
 
+    def test_en_curso_contenedor_inconsultable_definitivo(self):
+        self.agregar(programa("A", "2026-11-29"), {"estado": "en_curso", "contenedor_id": "C9"})
+        self.fallos["contenedor"] = meta(400, "contenedor inexistente")
+        self.media = [{"id": "7", "caption": "Titulo A", "timestamp": "2026-11-30T10:00:00+0000", "permalink": "https://ig/7"}]
+        self.assertEqual(self.correr()[0], 0)
+        self.assertEqual(self.estado("A")["estado"], "publicado")
+
+    def test_en_curso_contenedor_inconsultable_y_no_publicado(self):
+        self.agregar(programa("A", "2026-11-29"), {"estado": "en_curso", "contenedor_id": "C9"})
+        self.fallos["contenedor"] = meta(400, "contenedor inexistente")
+        self.assertEqual(self.correr()[0], 1)
+        self.assertEqual(self.estado("A")["estado"], "error")
+
+    def test_en_curso_contenedor_transitorio_no_cambia_nada(self):
+        self.agregar(programa("A", "2026-11-29"), {"estado": "en_curso", "contenedor_id": "C9"})
+        self.fallos["contenedor"] = meta(503)
+        self.assertEqual(self.correr()[0], 1)
+        self.assertEqual(self.estado("A")["estado"], "en_curso")
+
+    def test_fallo_en_media_publish_deja_en_curso_y_se_resuelve(self):
+        self.agregar(programa("A", "2026-11-29"))
+        for fallo in (meta(503), publicar.Transitorio("timeout")):
+            self.fallos["publish"] = fallo
+            self.assertEqual(self.correr()[0], 1)
+            self.assertEqual(self.estado("A")["estado"], "en_curso")
+            self.fallos = {}
+            self.estado_contenedor = ["PUBLISHED"]
+            self.media = [{"id": "7", "caption": "Titulo A", "timestamp": "2026-12-01T21:00:00+0000", "permalink": "https://ig/7"}]
+            self.assertEqual(self.correr()[0], 0)
+            self.assertEqual(self.estado("A")["estado"], "publicado")
+            os.remove(os.path.join(self.dir, "estado", "A.json"))
+            self.media, self.estado_contenedor = [], ["FINISHED"]
+
+    def test_contenedor_error_y_expired(self):
+        for terminal in ("ERROR", "EXPIRED"):
+            self.agregar(programa("A", "2026-11-29"))
+            self.estado_contenedor = [terminal]
+            self.assertNotEqual(self.correr()[0], 0)
+            self.assertEqual(self.estado("A")["estado"], "error")
+            self.assertIn(terminal, self.estado("A")["detalle"])
+            self.assertEqual(self.publicaciones(), [])
+            os.remove(os.path.join(self.dir, "estado", "A.json"))
+
+    def test_sondeo_agotado(self):
+        self.agregar(programa("A", "2026-11-29"))
+        self.estado_contenedor = ["IN_PROGRESS"]
+        self.assertNotEqual(self.correr()[0], 0)
+        self.assertEqual(self.estado("A")["estado"], "error")
+
+    def test_fallo_transitorio_al_crear_contenedor_reintenta_despues(self):
+        self.agregar(programa("A", "2026-11-29"))
+        for fallo in (meta(503), meta(429), publicar.Transitorio("timeout")):
+            self.fallos["crear"] = fallo
+            self.assertEqual(self.correr()[0], 1)
+            self.assertIsNone(self.estado("A"))
+        self.fallos = {}
+        self.assertEqual(self.correr()[0], 0)
+        self.assertEqual(self.estado("A")["estado"], "publicado")
+
+    def test_fallo_transitorio_al_descargar_video(self):
+        self.agregar(programa("A", "2026-11-29"))
+        self.fallos["sha"] = (503, "")
+        self.assertEqual(self.correr()[0], 1)
+        self.assertIsNone(self.estado("A"))
+
+    def test_estado_corrupto_bloquea(self):
+        self.agregar(programa("A", "2026-11-29"))
+        self.agregar(programa("B", "2026-11-29"))
+        with open(os.path.join(self.dir, "estado", "A.json"), "w") as f:
+            f.write("{no es json")
+        rc, salida = self.correr()
+        self.assertEqual(rc, 1)
+        self.assertIn("BLOQUEADO", salida)
+        self.assertEqual(self.llamadas, [])
+
+    def test_estado_sin_campo_reconocido_bloquea(self):
+        self.agregar(programa("A", "2026-11-29"), {"estado": "raro"})
+        self.assertEqual(self.correr()[0], 1)
+        self.assertEqual(self.llamadas, [])
+
+    def test_programa_invalido_se_saltea(self):
+        sin_fecha = programa("MALO", "2026-11-28")
+        del sin_fecha["fecha"]
+        self.agregar(sin_fecha)
+        self.agregar(programa("A", "2026-11-29"))
+        rc, salida = self.correr()
+        self.assertEqual(rc, 0)
+        self.assertIn("MALO", salida)
+        self.assertEqual(self.estado("A")["estado"], "publicado")
+
+    def test_reel_en_error_no_se_reintenta(self):
+        self.agregar(programa("A", "2026-11-29"), {"estado": "error"})
+        rc, _ = self.correr()
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.llamadas, [])
+
+    def test_ensayo_ya_publicado_no_se_republica(self):
+        self.agregar(programa("A", "2026-11-29"), {"estado": "publicado", "enlace": "https://ig/1"})
+        rc, salida = self.correr("--ensayo", "A")
+        self.assertEqual(rc, 0)
+        self.assertIn("no se republica", salida)
+        self.assertEqual(self.llamadas, [])
+
+    def test_ensayo_con_caracteres_raros_se_rechaza(self):
+        with self.assertRaises(SystemExit):
+            with mock.patch("sys.stderr", io.StringIO()):
+                publicar.main(["--ensayo", "../x"])
+
     def test_caption_de_2201_rechazado(self):
         self.agregar(programa("A", "2026-11-29", "x" * 2201))
         rc, salida = self.correr()
@@ -161,10 +317,11 @@ class Pruebas(Base):
         self.assertIn("2201", salida)
         self.assertEqual([c for c in self.llamadas if c[0] == "POST"], [])
 
-    def test_mas_de_30_hashtags(self):
-        self.agregar(programa("A", "2026-11-29", "T\n" + " ".join(f"#h{i}" for i in range(31))))
-        rc, _ = self.correr()
-        self.assertNotEqual(rc, 0)
+    def test_mas_de_30_hashtags_y_20_menciones(self):
+        for caption in ("T\n" + " ".join(f"#h{i}" for i in range(31)), "T\n" + " ".join(f"@u{i}" for i in range(21))):
+            self.agregar(programa("A", "2026-11-29", caption))
+            self.assertNotEqual(self.correr()[0], 0)
+            os.remove(os.path.join(self.dir, "estado", "A.json"))
 
     def test_sha_distinto(self):
         p = programa("A", "2026-11-29")
@@ -172,6 +329,7 @@ class Pruebas(Base):
         self.agregar(p)
         rc, _ = self.correr()
         self.assertNotEqual(rc, 0)
+        self.assertEqual(self.estado("A")["estado"], "error")
         self.assertEqual(self.publicaciones(), [])
 
     def test_simulacro_no_escribe_ni_publica(self):
@@ -181,27 +339,167 @@ class Pruebas(Base):
         self.assertEqual(self.publicaciones(), [])
         self.assertIsNone(self.estado("A"))
 
-    def test_token_enmascarado_en_errores(self):
-        def mala(metodo, url, datos=None, sha=False):
-            raise publicar.Fallo(publicar.mascara(f"fallo en {url}"))
+    def test_excepcion_inesperada_sale_con_1_y_sin_token(self):
         self.agregar(programa("A", "2026-11-29"))
-        with mock.patch.object(publicar, "http", mala):
-            rc, salida = self.correr()
-        self.assertNotEqual(rc, 0)
+        self.fallos["listar"] = KeyError(f"raro {TOKEN}")
+        rc, salida = self.correr()
+        self.assertEqual(rc, 1)
         self.assertNotIn(TOKEN, salida)
 
     def test_mascara(self):
-        t = publicar.mascara(f"https://g/x?fields=a&access_token={TOKEN}&y=1 y {TOKEN}")
-        self.assertNotIn(TOKEN, t)
+        self.assertNotIn(TOKEN, publicar.mascara(f"https://g/x?fields=a&access_token={TOKEN}&y=1 y {TOKEN}"))
 
     def test_error_http_de_meta_sin_token(self):
-        def error(metodo, url, datos=None, sha=False):
-            return 400, json.dumps({"error": {"message": "Invalid parameter", "code": 100}}).encode()
-        with mock.patch.object(publicar, "http", error):
-            with self.assertRaises(publicar.Fallo) as c:
-                publicar.api("GET", "42/media", fields="id")
+        self.fallos["listar"] = meta(400, "Invalid parameter")
+        with self.assertRaises(publicar.Fallo) as c:
+            publicar.api("GET", "42/media", fields="id")
         self.assertIn("Invalid parameter", str(c.exception))
         self.assertNotIn(TOKEN, str(c.exception))
+
+
+class Renovar(Base):
+    def setUp(self):
+        super().setUp()
+        self.gh = []
+        self.gh_rc = [0, 0, 0, 0]
+        self.parche = mock.patch.object(publicar.subprocess, "run", self.falso_run)
+        self.parche.start()
+        self.addCleanup(self.parche.stop)
+        os.environ["IG_TOKEN_FECHA"] = "2026-11-01"
+        os.environ["GH_PAT_SECRETS"] = "PAT"
+
+    def falso_run(self, cmd, input=None, env=None, **kw):
+        self.gh.append((cmd, input, env))
+        rc = self.gh_rc.pop(0) if self.gh_rc else 0
+        return subprocess.CompletedProcess(cmd, rc, "", "fallo gh" if rc else "")
+
+    def test_sin_fecha(self):
+        del os.environ["IG_TOKEN_FECHA"]
+        self.assertEqual(self.correr("--solo-renovar")[0], 1)
+        os.environ["IG_TOKEN_FECHA"] = "ayer"
+        self.assertEqual(self.correr("--solo-renovar")[0], 1)
+        self.assertEqual(self.gh, [])
+
+    def test_reciente_no_renueva(self):
+        os.environ["IG_TOKEN_FECHA"] = "2026-11-28"
+        self.assertEqual(self.correr("--solo-renovar")[0], 0)
+        self.assertEqual(self.llamadas, [])
+
+    def test_renueva_y_registra_actividad(self):
+        rc, salida = self.correr("--solo-renovar")
+        self.assertEqual(rc, 0)
+        secreto = self.gh[0]
+        self.assertEqual(secreto[1], "NUEVO_TOKEN")
+        self.assertEqual(secreto[2]["GH_TOKEN"], "PAT")
+        self.assertNotIn("NUEVO_TOKEN", salida)
+        probar = next(c for c in self.llamadas if "/me?" in c[1])
+        self.assertIn("access_token=NUEVO_TOKEN", probar[1])
+        with open(os.path.join(self.dir, "ultima_renovacion.txt")) as f:
+            self.assertEqual(f.read().strip(), "2026-12-01")
+
+    def test_publicar_no_renueva_ni_usa_pat(self):
+        self.agregar(programa("A", "2026-11-29"))
+        self.correr()
+        self.assertFalse([c for c in self.llamadas if "refresh" in c[1]])
+        self.assertFalse([g for g in self.gh if g[2] and "PAT" in g[2].values()])
+
+    def test_token_nuevo_vacio_no_escribe_secreto(self):
+        self.fallos["refresh"] = (200, json.dumps({"access_token": ""}).encode())
+        self.assertEqual(self.correr("--solo-renovar")[0], 1)
+        self.assertEqual(self.gh, [])
+
+    def test_token_nuevo_que_no_funciona_no_escribe_secreto(self):
+        self.fallos["me"] = meta(400, "token inválido")
+        self.assertEqual(self.correr("--solo-renovar")[0], 1)
+        self.assertEqual(self.gh, [])
+
+    def test_gh_secret_falla_reintenta_una_vez(self):
+        self.gh_rc = [1, 0, 0]
+        self.assertEqual(self.correr("--solo-renovar")[0], 0)
+        self.assertEqual([g[0][1] for g in self.gh], ["secret", "secret", "variable"])
+        self.gh_rc, self.gh = [1, 1], []
+        self.assertEqual(self.correr("--solo-renovar")[0], 1)
+        self.assertEqual(len(self.gh), 2)
+
+    def test_add_mask_en_actions(self):
+        os.environ["GITHUB_ACTIONS"] = "true"
+        rc, salida = self.correr("--solo-renovar")
+        self.assertEqual(rc, 0)
+        self.assertTrue(salida.startswith(f"::add-mask::{TOKEN}"))
+        self.assertIn("::add-mask::NUEVO_TOKEN", salida)
+
+
+class MascaraEnRedReal(unittest.TestCase):
+    def test_url_con_token_no_aparece(self):
+        url = "https://graph.instagram.com/x?access_token=SECRETO"
+        errores = [urllib.error.URLError(f"fallo conectando a {url}"),
+                   urllib.error.HTTPError(url, 500, f"error en {url}", {}, io.BytesIO(
+                       b'{"error": {"message": "mal access_token=SECRETO"}}')),
+                   urllib.error.HTTPError(url, 400, "x", {}, io.BytesIO(
+                       b'{"error": {"message": "mal access_token=SECRETO y SECRETO"}}'))]
+        with mock.patch.dict(os.environ, {"IG_TOKEN": "SECRETO", "IG_USER_ID": "42"}):
+            for err in errores:
+                with mock.patch("urllib.request.urlopen", side_effect=err):
+                    with self.assertRaises(publicar.Fallo) as c:
+                        publicar.api("GET", "42/media", fields="id")
+                self.assertNotIn("SECRETO", str(c.exception))
+
+
+class GitReal(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir)
+        env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        p = mock.patch.dict(os.environ, env)
+        p.start()
+        self.addCleanup(p.stop)
+        self.bare, self.a, self.b = (os.path.join(self.dir, n) for n in ("bare.git", "a", "b"))
+        self.g("init", "-q", "--bare", "-b", "main", self.bare)
+        self.g("clone", "-q", self.bare, self.a)
+        self.g("-C", self.a, "checkout", "-q", "-b", "main")
+        with open(os.path.join(self.a, "LEAME"), "w") as f:
+            f.write("x")
+        self.g("-C", self.a, "add", "LEAME")
+        self.g("-C", self.a, "commit", "-q", "-m", "inicio")
+        self.g("-C", self.a, "push", "-q", "-u", "origin", "main")
+        self.g("clone", "-q", self.bare, self.b)
+        pr = mock.patch.object(publicar, "RAIZ", self.a)
+        pr.start()
+        self.addCleanup(pr.stop)
+        self.args = argparse.Namespace(simulacro=False, sin_git=False)
+
+    def g(self, *a):
+        return subprocess.run(["git", *a], check=True, capture_output=True, text=True).stdout
+
+    def commits(self):
+        return self.g("-C", self.bare, "log", "--format=%s", "main").splitlines()
+
+    def test_commit_y_push(self):
+        publicar.guardar_estado("A", {"estado": "en_curso", "contenedor_id": "C1"}, self.args)
+        self.assertEqual(self.commits()[0], "estado: A en_curso")
+
+    def test_reintenta_con_pull_si_el_remoto_avanzo(self):
+        with open(os.path.join(self.b, "otro.txt"), "w") as f:
+            f.write("y")
+        self.g("-C", self.b, "add", "otro.txt")
+        self.g("-C", self.b, "commit", "-q", "-m", "desde el teléfono")
+        self.g("-C", self.b, "push", "-q")
+        publicar.guardar_estado("A", {"estado": "publicado"}, self.args)
+        self.assertEqual(self.commits()[:2], ["estado: A publicado", "desde el teléfono"])
+
+    def test_estado_a_pendiente_borra_y_sube(self):
+        publicar.guardar_estado("A", {"estado": "en_curso"}, self.args)
+        publicar.guardar_estado("A", None, self.args)
+        self.assertEqual(self.commits()[0], "estado: A vuelve a pendiente")
+        self.assertFalse(os.path.exists(os.path.join(self.a, "estado", "A.json")))
+
+    def test_pausa_remota(self):
+        self.assertFalse(publicar.hay_pausa(self.args))
+        open(os.path.join(self.b, "Pausa"), "w").close()
+        self.g("-C", self.b, "add", "Pausa")
+        self.g("-C", self.b, "commit", "-q", "-m", "pausa")
+        self.g("-C", self.b, "push", "-q")
+        self.assertTrue(publicar.hay_pausa(self.args))
 
 
 if __name__ == "__main__":

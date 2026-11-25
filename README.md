@@ -8,7 +8,7 @@ Publica en Instagram, a las 18:17 (Argentina), el primer reel pendiente cuya fec
 
 ## Pausar
 
-Crear un archivo vacío llamado `PAUSA` en la raíz (desde la app de GitHub en el teléfono: Add file > Create new file). Borrarlo para reanudar.
+Crear un archivo vacío llamado `PAUSA` (o cualquier nombre que empiece con «pausa», sin importar mayúsculas) en la raíz (desde la app de GitHub en el teléfono: Add file > Create new file). Se controla al arrancar y de nuevo justo antes de publicar (si aparece en ese intervalo, el reel vuelve a pendiente). Borrarlo para reanudar.
 
 ## Correr a mano
 
@@ -19,4 +19,12 @@ Crear un archivo vacío llamado `PAUSA` en la raíz (desde la app de GitHub en e
 ## Secretos y variables (Settings > Secrets and variables > Actions)
 
 - Secretos: `IG_TOKEN`, `IG_USER_ID`, `GH_PAT_SECRETS` (token personal con permiso para escribir secretos y variables del repositorio; solo se usa para renovar el token).
-- Variable: `IG_TOKEN_FECHA` (AAAA-MM-DD de la última emisión/renovación del token; el script lo renueva si pasaron más de 7 días).
+- Variable: `IG_TOKEN_FECHA` (AAAA-MM-DD de la última emisión/renovación del token). Si falta o es ilegible, el paso de renovación falla a propósito.
+
+## Renovación del token e inactividad
+
+El workflow tiene dos pasos. «Publicar» no ve `GH_PAT_SECRETS`. «Renovar token» (`--solo-renovar`, corre siempre salvo en simulacro) renueva el token cuando pasaron más de 7 días, lo prueba contra `/me`, actualiza el secreto `IG_TOKEN` y la variable `IG_TOKEN_FECHA`, y registra la fecha en `ultima_renovacion.txt` con commit y push. Ese commit semanal cuenta como actividad: GitHub desactiva los cron de repositorios públicos tras 60 días sin actividad.
+
+## Fallos y reintentos
+
+Fallas transitorias (red, 5xx, 429) no escriben estado y se reintentan en la próxima corrida. Un reel en `error` no se reintenta solo: borrar `estado/<ENSAYO>.json` (o correr con `--ensayo`). Un `estado/*.json` ilegible bloquea toda la cola hasta corregirlo.
