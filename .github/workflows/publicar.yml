@@ -1,0 +1,53 @@
+name: Publicar reel
+
+on:
+  schedule:
+    # 21:17 UTC = 18:17 en Argentina (UTC-3)
+    - cron: "17 21 * * *"
+  workflow_dispatch:
+    inputs:
+      ensayo:
+        description: "Ensayo puntual (vacío = el siguiente pendiente)"
+        required: false
+        default: ""
+      modo:
+        description: "Modo"
+        type: choice
+        options: [publicar, simulacro, conciliar]
+        default: publicar
+
+concurrency:
+  group: publicar
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  publicar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Identidad de git del bot
+        run: |
+          git config user.name "publicador-bot"
+          git config user.email "publicador-bot@users.noreply.github.com"
+
+      - name: Publicar
+        env:
+          IG_TOKEN: ${{ secrets.IG_TOKEN }}
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          IG_TOKEN_FECHA: ${{ vars.IG_TOKEN_FECHA }}
+          GH_TOKEN: ${{ github.token }}
+          GH_PAT_SECRETS: ${{ secrets.GH_PAT_SECRETS }}
+          ENSAYO: ${{ inputs.ensayo }}
+          MODO: ${{ inputs.modo }}
+        run: |
+          args=()
+          [ -n "$ENSAYO" ] && args+=(--ensayo "$ENSAYO")
+          [ "$MODO" = "simulacro" ] && args+=(--simulacro)
+          [ "$MODO" = "conciliar" ] && args+=(--conciliar)
+          python3 publicar.py "${args[@]}"
