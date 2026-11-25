@@ -13,7 +13,7 @@ on:
       modo:
         description: "Modo"
         type: choice
-        options: [publicar, simulacro, conciliar]
+        options: [publicar, simulacro, conciliar, verificar]
         default: publicar
 
 concurrency:
@@ -48,12 +48,5 @@ jobs:
           [ -n "$ENSAYO" ] && args+=(--ensayo "$ENSAYO")
           [ "$MODO" = "simulacro" ] && args+=(--simulacro)
           [ "$MODO" = "conciliar" ] && args+=(--conciliar)
+          [ "$MODO" = "verificar" ] && args+=(--verificar)
           python3 publicar.py "${args[@]}"
-
-      - name: Renovar token
-        if: always() && inputs.modo != 'simulacro'
-        env:
-          IG_TOKEN: ${{ secrets.IG_TOKEN }}
-          IG_TOKEN_FECHA: ${{ vars.IG_TOKEN_FECHA }}
-          GH_PAT_SECRETS: ${{ secrets.GH_PAT_SECRETS }}
-        run: python3 publicar.py --solo-renovar

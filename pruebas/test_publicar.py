@@ -41,7 +41,7 @@ class Base(unittest.TestCase):
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
-        for v in ("IG_TOKEN_FECHA", "GITHUB_ACTIONS", "GH_PAT_SECRETS", "GITHUB_REPOSITORY"):
+        for v in ("GITHUB_ACTIONS",):
             os.environ.pop(v, None)
         self.llamadas, self.issues, self.media = [], [], []
         self.fallos = {}
@@ -81,10 +81,10 @@ class Base(unittest.TestCase):
             ok = (200, json.dumps({"status_code": e.pop(0) if len(e) > 1 else e[0]}).encode())
         elif "/M1?" in url:
             clave, ok = "permalink", (200, json.dumps({"permalink": "https://instagram.com/reel/M1"}).encode())
-        elif "refresh_access_token" in url:
-            clave, ok = "refresh", (200, json.dumps({"access_token": "NUEVO_TOKEN"}).encode())
-        elif "/me?" in url:
-            clave, ok = "me", (200, json.dumps({"user_id": "42"}).encode())
+        elif "content_publishing_limit" in url:
+            clave, ok = "limite", (200, json.dumps({"data": [{"quota_usage": 3, "config": {"quota_total": 100, "quota_duration": 86400}}]}).encode())
+        elif "/v27.0/42?" in url:
+            clave, ok = "cuenta", (200, json.dumps({"username": "doblecielo", "media_count": 12}).encode())
         elif sha:
             clave, ok = "sha", (200, "abc")
         else:
@@ -357,76 +357,45 @@ class Pruebas(Base):
         self.assertNotIn(TOKEN, str(c.exception))
 
 
-class Renovar(Base):
-    def setUp(self):
-        super().setUp()
-        self.gh = []
-        self.gh_rc = [0, 0, 0, 0]
-        self.parche = mock.patch.object(publicar.subprocess, "run", self.falso_run)
-        self.parche.start()
-        self.addCleanup(self.parche.stop)
-        os.environ["IG_TOKEN_FECHA"] = "2026-11-01"
-        os.environ["GH_PAT_SECRETS"] = "PAT"
-
-    def falso_run(self, cmd, input=None, env=None, **kw):
-        self.gh.append((cmd, input, env))
-        rc = self.gh_rc.pop(0) if self.gh_rc else 0
-        return subprocess.CompletedProcess(cmd, rc, "", "fallo gh" if rc else "")
-
-    def test_sin_fecha(self):
-        del os.environ["IG_TOKEN_FECHA"]
-        self.assertEqual(self.correr("--solo-renovar")[0], 1)
-        os.environ["IG_TOKEN_FECHA"] = "ayer"
-        self.assertEqual(self.correr("--solo-renovar")[0], 1)
-        self.assertEqual(self.gh, [])
-
-    def test_reciente_no_renueva(self):
-        os.environ["IG_TOKEN_FECHA"] = "2026-11-28"
-        self.assertEqual(self.correr("--solo-renovar")[0], 0)
-        self.assertEqual(self.llamadas, [])
-
-    def test_renueva_y_registra_actividad(self):
-        rc, salida = self.correr("--solo-renovar")
-        self.assertEqual(rc, 0)
-        secreto = self.gh[0]
-        self.assertEqual(secreto[1], "NUEVO_TOKEN")
-        self.assertEqual(secreto[2]["GH_TOKEN"], "PAT")
-        self.assertNotIn("NUEVO_TOKEN", salida)
-        probar = next(c for c in self.llamadas if "/me?" in c[1])
-        self.assertIn("access_token=NUEVO_TOKEN", probar[1])
-        with open(os.path.join(self.dir, "ultima_renovacion.txt")) as f:
-            self.assertEqual(f.read().strip(), "2026-12-01")
-
-    def test_publicar_no_renueva_ni_usa_pat(self):
-        self.agregar(programa("A", "2026-11-29"))
-        self.correr()
-        self.assertFalse([c for c in self.llamadas if "refresh" in c[1]])
-        self.assertFalse([g for g in self.gh if g[2] and "PAT" in g[2].values()])
-
-    def test_token_nuevo_vacio_no_escribe_secreto(self):
-        self.fallos["refresh"] = (200, json.dumps({"access_token": ""}).encode())
-        self.assertEqual(self.correr("--solo-renovar")[0], 1)
-        self.assertEqual(self.gh, [])
-
-    def test_token_nuevo_que_no_funciona_no_escribe_secreto(self):
-        self.fallos["me"] = meta(400, "token inválido")
-        self.assertEqual(self.correr("--solo-renovar")[0], 1)
-        self.assertEqual(self.gh, [])
-
-    def test_gh_secret_falla_reintenta_una_vez(self):
-        self.gh_rc = [1, 0, 0]
-        self.assertEqual(self.correr("--solo-renovar")[0], 0)
-        self.assertEqual([g[0][1] for g in self.gh], ["secret", "secret", "variable"])
-        self.gh_rc, self.gh = [1, 1], []
-        self.assertEqual(self.correr("--solo-renovar")[0], 1)
-        self.assertEqual(len(self.gh), 2)
-
+class Verificar(Base):
     def test_add_mask_en_actions(self):
         os.environ["GITHUB_ACTIONS"] = "true"
-        rc, salida = self.correr("--solo-renovar")
+        rc, salida = self.correr("--verificar")
         self.assertEqual(rc, 0)
         self.assertTrue(salida.startswith(f"::add-mask::{TOKEN}"))
-        self.assertIn("::add-mask::NUEVO_TOKEN", salida)
+
+    def test_verificar_imprime_y_no_escribe(self):
+        self.agregar(programa("A", "2026-11-29"))
+        rc, salida = self.correr("--verificar")
+        self.assertEqual(rc, 0)
+        self.assertIn("Usuario: doblecielo", salida)
+        self.assertIn("Publicaciones: 12", salida)
+        self.assertIn("3 de 100", salida)
+        self.assertTrue(all(c[0] == "GET" and "/me" not in c[1] for c in self.llamadas))
+        self.assertTrue(all(c[1].startswith("https://graph.facebook.com/v27.0/42") for c in self.llamadas))
+        self.assertIsNone(self.estado("A"))
+
+    def test_verificar_con_pausa_igual_responde(self):
+        open(os.path.join(self.dir, "PAUSA"), "w").close()
+        self.assertEqual(self.correr("--verificar")[0], 0)
+
+    def test_verificar_falla(self):
+        self.fallos["cuenta"] = meta(400, "no existe")
+        self.assertEqual(self.correr("--verificar")[0], 1)
+
+    def test_token_invalido_190_en_cualquier_modo(self):
+        self.agregar(programa("A", "2026-11-29"))
+        self.fallos["listar"] = (400, json.dumps({"error": {"message": "Session has expired", "code": 190}}).encode())
+        for modo in ((), ("--conciliar",), ("--simulacro",)):
+            rc, salida = self.correr(*modo)
+            self.assertEqual(rc, 1)
+            self.assertIn("El token de Instagram no es válido", salida)
+            self.assertIn("IG_TOKEN", salida)
+        self.assertIsNone(self.estado("A"))
+        self.fallos = {"cuenta": (400, json.dumps({"error": {"message": "x", "code": 190}}).encode())}
+        rc, salida = self.correr("--verificar")
+        self.assertEqual(rc, 1)
+        self.assertIn("no es válido", salida)
 
 
 class MascaraEnRedReal(unittest.TestCase):

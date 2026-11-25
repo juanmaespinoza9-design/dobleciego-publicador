@@ -4,8 +4,8 @@ Publica en Instagram, como máximo un reel por corrida, el primer reel pendiente
 programa/<ENSAYO>.json lo escribe la Mac; estado/<ENSAYO>.json lo escribe solo este script.
 Si existe el archivo PAUSA en la raíz, no se publica nada.
 
-Uso: python3 publicar.py [--ensayo NOMBRE] [--simulacro] [--conciliar] [--listar] [--sin-git] [--solo-renovar]
-Entorno: IG_TOKEN, IG_USER_ID, GH_TOKEN. Solo con --solo-renovar: IG_TOKEN_FECHA (AAAA-MM-DD) y GH_PAT_SECRETS.
+Uso: python3 publicar.py [--ensayo NOMBRE] [--simulacro] [--conciliar] [--listar] [--sin-git] [--verificar]
+Entorno: IG_TOKEN (token de usuario del sistema, no vence), IG_USER_ID, GH_TOKEN.
 """
 import argparse
 import datetime as dt
@@ -22,7 +22,7 @@ import urllib.request
 from http.client import HTTPException
 
 RAIZ = os.path.dirname(os.path.abspath(__file__))
-API = "https://graph.instagram.com"
+API_HOST = "https://graph.facebook.com"
 API_VERSION = "v27.0"
 # Parámetro de Meta que rotula el contenido como generado por IA (confirmado en la documentación
 # de publicación; falta confirmarlo para reels). Si el contenedor falla por él, ponerlo en None.
@@ -34,7 +34,6 @@ MAX_MENCIONES = 20
 HORAS_ENTRE_PUBLICACIONES = 20
 SONDEO_SEG = 60
 SONDEO_LIMITE_SEG = 600
-DIAS_RENOVAR_TOKEN = 7
 UTC_AR = dt.timedelta(hours=-3)
 ESTADOS = ("en_curso", "publicado", "error")
 REQUERIDOS = ("ensayo", "fecha", "video_url", "cover_url", "caption", "sha256_video")
@@ -44,6 +43,14 @@ SECRETOS_EXTRA = []
 
 class Fallo(Exception):
     pass
+
+
+MSG_TOKEN = ("El token de Instagram no es válido: hay que generar uno nuevo en la aplicación de Meta "
+             "y cargarlo como secreto IG_TOKEN")
+
+
+class TokenInvalido(Exception):
+    """Token rechazado por Meta (código 190): corta la corrida sin tocar estados."""
 
 
 class Transitorio(Fallo):
@@ -96,9 +103,9 @@ def transitorio(codigo):
     return codigo >= 500 or codigo == 429
 
 
-def api(metodo, ruta, token=None, **params):
-    params["access_token"] = token or os.environ["IG_TOKEN"]
-    base = f"{API}/{ruta}" if ruta == "refresh_access_token" else f"{API}/{API_VERSION}/{ruta}"
+def api(metodo, ruta, **params):
+    params["access_token"] = os.environ["IG_TOKEN"]
+    base = f"{API_HOST}/{API_VERSION}/{ruta}"
     if metodo == "GET":
         codigo, cuerpo = http("GET", base + "?" + urllib.parse.urlencode(params))
     else:
@@ -109,6 +116,8 @@ def api(metodo, ruta, token=None, **params):
         raise (Transitorio if transitorio(codigo) else Fallo)(mascara(f"Respuesta no válida de la API (HTTP {codigo})"))
     if codigo >= 400 or "error" in r:
         e = r.get("error", {}) if isinstance(r, dict) else {}
+        if e.get("code") == 190:
+            raise TokenInvalido(MSG_TOKEN)
         clase = Transitorio if transitorio(codigo) or e.get("is_transient") else Fallo
         raise clase(mascara(f"API de Meta (HTTP {codigo}, código {e.get('code')}): {e.get('message', r)}"))
     return r
@@ -470,53 +479,16 @@ def listar():
     return 0
 
 
-def gh_con_reintento(cmd, entrada, env):
-    for intento in (1, 2):
-        r = subprocess.run(cmd, input=entrada, env=env, capture_output=True, text=True)
-        if r.returncode == 0:
-            return
-        aviso(f"{' '.join(cmd[:3])} falló (intento {intento}): {r.stderr.strip()}")
-    raise Fallo(f"{' '.join(cmd[:3])} falló dos veces")
-
-
-def renovar_token(args):
-    """Único camino que usa GH_PAT_SECRETS. Renueva el token si pasaron más de DIAS_RENOVAR_TOKEN días."""
-    try:
-        fecha = dt.date.fromisoformat(os.environ.get("IG_TOKEN_FECHA", "").strip())
-    except ValueError:
-        print("!!! IG_TOKEN_FECHA falta o no es AAAA-MM-DD: no se puede saber cuándo renovar el token de Instagram. "
-              "Definir la variable con la fecha de emisión del token.", flush=True)
-        return 1
-    if (hoy() - fecha).days <= DIAS_RENOVAR_TOKEN:
-        print(f"Token con {(hoy() - fecha).days} días: todavía no toca renovarlo.")
-        return 0
-    try:
-        nuevo = api("GET", "refresh_access_token", grant_type="ig_refresh_token").get("access_token")
-        if not isinstance(nuevo, str) or not nuevo.strip():
-            raise Fallo("la API devolvió un token vacío")
-        SECRETOS_EXTRA.append(nuevo)
-        if os.environ.get("GITHUB_ACTIONS"):
-            print(f"::add-mask::{nuevo}", flush=True)
-        api("GET", "me", token=nuevo, fields="user_id")
-        if not os.environ.get("GH_PAT_SECRETS"):
-            raise Fallo("falta GH_PAT_SECRETS")
-        env = {**os.environ, "GH_TOKEN": os.environ["GH_PAT_SECRETS"]}
-        repo = ["--repo", os.environ["GITHUB_REPOSITORY"]] if os.environ.get("GITHUB_REPOSITORY") else []
-        gh_con_reintento(["gh", "secret", "set", "IG_TOKEN", *repo], nuevo, env)
-        gh_con_reintento(["gh", "variable", "set", "IG_TOKEN_FECHA", "--body", hoy().isoformat(), *repo], None, env)
-    except Fallo as e:
-        print(mascara(f"!!! NO SE PUDO RENOVAR EL TOKEN DE INSTAGRAM: {e}. Vence a los 60 días; renovarlo a mano."), flush=True)
-        return 1
-    aviso("Token de Instagram renovado.")
-    try:
-        with open(os.path.join(RAIZ, "ultima_renovacion.txt"), "w", encoding="utf-8") as f:
-            f.write(hoy().isoformat() + "\n")
-        if not args.sin_git:
-            subir_cambios("ultima_renovacion.txt", f"renovación del token {hoy().isoformat()}")
-    except (Fallo, OSError) as e:
-        print(mascara(f"ADVERTENCIA: no se pudo registrar ultima_renovacion.txt ({e}); sin actividad GitHub puede "
-                      "desactivar el cron."), flush=True)
-        return 1
+def verificar():
+    uid = os.environ["IG_USER_ID"]
+    cuenta = api("GET", uid, fields="username,media_count")
+    limite = api("GET", f"{uid}/content_publishing_limit", fields="quota_usage,config")
+    datos = (limite.get("data") or [{}])[0]
+    cfg = datos.get("config", {})
+    print(f"Usuario: {cuenta.get('username')}")
+    print(f"Publicaciones: {cuenta.get('media_count')}")
+    print(f"Cuota de publicación: {datos.get('quota_usage')} de {cfg.get('quota_total')} "
+          f"(ventana de {cfg.get('quota_duration')} s)")
     return 0
 
 
@@ -529,17 +501,14 @@ def ensayo_valido(texto):
 def ejecutar(args):
     if args.listar:
         return listar()
-    if args.solo_renovar:
-        if not os.environ.get("IG_TOKEN"):
-            print("Falta IG_TOKEN en el entorno.")
-            return 1
-        return renovar_token(args)
-    if not args.conciliar and pausa_en_disco():
+    if not (args.conciliar or args.verificar) and pausa_en_disco():
         print("Existe un archivo PAUSA: no se publica nada.")
         return 0
     if not os.environ.get("IG_TOKEN") or not os.environ.get("IG_USER_ID"):
         print("Faltan IG_TOKEN o IG_USER_ID en el entorno.")
         return 1
+    if args.verificar:
+        return verificar()
     if args.conciliar:
         return conciliar(args)
     rc = resolver_en_curso(args)
@@ -553,12 +522,14 @@ def main(argv=None):
     ap.add_argument("--conciliar", action="store_true", help="marca como publicados los que ya están en Instagram")
     ap.add_argument("--listar", action="store_true", help="muestra la cola sin usar la red")
     ap.add_argument("--sin-git", action="store_true", help="escribe el estado sin commit ni push; PAUSA solo en disco")
-    ap.add_argument("--solo-renovar", action="store_true", help="solo renueva el token si toca")
+    ap.add_argument("--verificar", action="store_true", help="solo lectura: cuenta, publicaciones y cuota")
     args = ap.parse_args(argv)
     if os.environ.get("GITHUB_ACTIONS") and os.environ.get("IG_TOKEN"):
         print(f"::add-mask::{os.environ['IG_TOKEN']}", flush=True)
     try:
         return ejecutar(args)
+    except TokenInvalido as e:
+        aviso(f"Error: {e}")
     except Fallo as e:
         aviso(f"Error: {e}")
     except Exception as e:

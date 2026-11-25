@@ -12,18 +12,20 @@ Crear un archivo vacío llamado `PAUSA` (o cualquier nombre que empiece con «pa
 
 ## Correr a mano
 
-- Desde GitHub: Actions > Publicar reel > Run workflow (modo `publicar`, `simulacro` o `conciliar`; `ensayo` opcional).
+- Desde GitHub: Actions > Publicar reel > Run workflow (modo `publicar`, `simulacro`, `conciliar` o `verificar`; `ensayo` opcional).
 - Local: `python3 publicar.py --listar` (sin red), o con `IG_TOKEN` e `IG_USER_ID` exportados: `--simulacro`, `--conciliar`, `--ensayo NOMBRE`, `--sin-git`.
 - Pruebas: `python3 -m unittest discover pruebas`.
 
-## Secretos y variables (Settings > Secrets and variables > Actions)
+## Secretos (Settings > Secrets and variables > Actions)
 
-- Secretos: `IG_TOKEN`, `IG_USER_ID`, `GH_PAT_SECRETS` (token personal con permiso para escribir secretos y variables del repositorio; solo se usa para renovar el token).
-- Variable: `IG_TOKEN_FECHA` (AAAA-MM-DD de la última emisión/renovación del token). Si falta o es ilegible, el paso de renovación falla a propósito.
+- `IG_TOKEN`: token de usuario del sistema de la aplicación de Meta («inicio de sesión unificado», prefijo `EAA`). No vence, así que no hay renovación automática.
+- `IG_USER_ID`: id de la cuenta de Instagram profesional. Todas las llamadas lo usan explícito; nunca `/me`.
 
-## Renovación del token e inactividad
+Si el token se revoca o Meta responde «código 190», el script avisa «El token de Instagram no es válido» y sale con error: generar uno nuevo en la aplicación de Meta (usuario del sistema > generar token, con permisos de publicación en Instagram) y reemplazar el secreto `IG_TOKEN`. Comprobarlo con Actions > Run workflow > modo `verificar` (solo lectura: usuario, cantidad de publicaciones y cuota de publicación) o localmente con `python3 publicar.py --verificar`.
 
-El workflow tiene dos pasos. «Publicar» no ve `GH_PAT_SECRETS`. «Renovar token» (`--solo-renovar`, corre siempre salvo en simulacro) renueva el token cuando pasaron más de 7 días, lo prueba contra `/me`, actualiza el secreto `IG_TOKEN` y la variable `IG_TOKEN_FECHA`, y registra la fecha en `ultima_renovacion.txt` con commit y push. Ese commit semanal cuenta como actividad: GitHub desactiva los cron de repositorios públicos tras 60 días sin actividad.
+## Inactividad del cron
+
+GitHub desactiva los cron de un repositorio público tras 60 días sin commits. Mientras hay reels por publicar, los commits de estado cuentan como actividad; con una PAUSA muy larga o la cola vacía, el cron se apaga. Se reactiva desde la pestaña Actions (habilitar el workflow).
 
 ## Fallos y reintentos
 
