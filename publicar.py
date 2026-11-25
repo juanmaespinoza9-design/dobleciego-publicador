@@ -489,6 +489,8 @@ def verificar():
     print(f"Publicaciones: {cuenta.get('media_count')}")
     print(f"Cuota de publicación: {datos.get('quota_usage')} de {cfg.get('quota_total')} "
           f"(ventana de {cfg.get('quota_duration')} s)")
+    for m in listar_media(paginas=20):
+        print(f"  {m.get('timestamp', '')[:10]}  {primera_linea(m.get('caption', ''))[:70]}")
     return 0
 
 

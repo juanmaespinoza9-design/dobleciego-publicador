@@ -1,3 +1,4 @@
+import re
 import argparse
 import datetime as dt
 import io
@@ -371,7 +372,7 @@ class Verificar(Base):
         self.assertIn("Usuario: doblecielo", salida)
         self.assertIn("Publicaciones: 12", salida)
         self.assertIn("3 de 100", salida)
-        self.assertTrue(all(c[0] == "GET" and "/me" not in c[1] for c in self.llamadas))
+        self.assertTrue(all(c[0] == "GET" and not re.search(r"/me([/?]|$)", c[1]) for c in self.llamadas))
         self.assertTrue(all(c[1].startswith("https://graph.facebook.com/v27.0/42") for c in self.llamadas))
         self.assertIsNone(self.estado("A"))
 
